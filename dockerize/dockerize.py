@@ -5,6 +5,7 @@ from __future__ import absolute_import
 
 import glob
 import grp
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,19 @@ from jinja2 import Environment, PackageLoader
 from .depsolver import DepSolver
 
 LOG = logging.getLogger(__name__)
+
+def hash_realpath(filepath):
+    real_file = os.path.realpath(filepath)
+    LOG.info(f"hashing {filepath} (realpath: {real_file})")
+    BUFFER = 65536
+    hash = hashlib.sha1()
+    with open(real_file, "rb") as f:
+        while True:
+            data = f.read(BUFFER)
+            if not data:
+                break
+            hash.update(data)
+    return hash.hexdigest()
 
 
 # Link handling constants
@@ -212,12 +226,26 @@ class Dockerize(object):
 
         # Install some basic nss libraries to permit programs to resolve
         # users, groups, and hosts.
+        lib_hashes = dict()  # store paths for deduplication
         for libdir in deps.prefixes():
             for nsslib in os.listdir(libdir):
                 if nsslib.startswith('libnss') or nsslib.startswith('libresolv'):
                     src = os.path.join(libdir, nsslib)
-                    LOG.info('copying %s', src)
-                    self.copy_file(src, symlinks=SymlinkOptions.COPY_ALL)
+
+                    hashed_lib = hash_realpath(src)  # get hash of file (resolving realpath)
+                    if hashed_lib not in lib_hashes:
+                        LOG.info('copying %s', src)
+                        self.copy_file(src, symlinks=SymlinkOptions.COPY_ALL)  # copies following symlink
+                        lib_hashes[hashed_lib] = src
+                    else:
+                        linked = os.path.join(self.targetdir, src[1:])  # remove leading slash to prepend targetdir
+                        LOG.info('linking %s to %s', lib_hashes[hashed_lib], linked)
+                        if not os.path.islink(linked):
+                            if os.path.isfile(linked):
+                                LOG.info(f"replacing {linked} with link to {lib_hashes[hashed_lib]}")
+                                os.remove(linked)
+                            os.symlink(lib_hashes[hashed_lib], linked)
+
 
     def copy_files(self):
         '''Process the list of paths generated via add_file and copy items
